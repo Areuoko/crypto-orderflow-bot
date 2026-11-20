@@ -2,9 +2,14 @@ import os
 import sys
 import time
 import html
+import socket
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+import urllib3.util.connection as urllib3_cn
+
+# اجبار به استفاده از IPv4 برای جلوگیری از تایم‌اوت تلگرام روی سرورهای گیت‌هاب
+urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
 # ==========================================
 # تنظیمات اصلی (در صورت نیاز قابل تغییر)
@@ -436,13 +441,26 @@ def send_telegram(bot_token: str, chat_id: str, text: str) -> None:
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    r = SESSION.post(url, json=payload, timeout=12)
-    if r.status_code != 200:
-        print(f"Telegram error {r.status_code}: {r.text}", file=sys.stderr)
+    for attempt in range(3):
+        try:
+            r = requests.post(
+                url,
+                json=payload,
+                headers={"Connection": "close"},
+                timeout=(10, 25),
+            )
+            if r.status_code == 200:
+                print("Telegram sent OK.")
+                return
+            print(f"Telegram HTTP {r.status_code}: {r.text}", file=sys.stderr)
+            if 400 <= r.status_code < 500:
+                return
+        except Exception as e:
+            print(f"Telegram attempt {attempt + 1}/3 failed: {e}", file=sys.stderr)
+        time.sleep(2 * (attempt + 1))
 
 
 def format_alert_message(symbol: str, direction: str, items: list) -> str:
-    # مرتب‌سازی بر اساس بالاترین امتیاز و تایم‌فریم بزرگ‌تر
     tf_rank = {"4h": 4, "1h": 3, "30m": 2, "15m": 1}
     items.sort(key=lambda x: (x["score"], tf_rank.get(x["tf"], 0)), reverse=True)
     best = items[0]
@@ -491,7 +509,7 @@ def main():
     now_ms = int(time.time() * 1000)
     hl_contexts = fetch_hyperliquid_contexts()
 
-    # دریافت هم‌زمان کندل‌های 15 ارز در 4 تایم‌فریم (60 درخواست سبک)
+    # دریافت هم‌زمان کندل‌های 15 ارز در 4 تایم‌فریم
     tasks = []
     klines_map = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -531,7 +549,6 @@ def main():
                     res["tf"] = tf
                     candidates.append(res)
                 elif run_mode == "test":
-                    # برای گزارش تست، وضعیت کلی بازار را نگه می‌داریم
                     curr = closed[-1]
                     avg_v = sum(c["qvol"] for c in closed[-21:-1]) / 20.0
                     near_misses.append((curr["qvol"] / max(avg_v, 1.0), sym, tf, curr["close"]))
@@ -589,9 +606,4 @@ def main():
         send_telegram(bot_token, chat_id, status_msg)
 
     print(
-        f"Done | mode={run_mode} | candidates={len(candidates)} | alerts_sent={sent_count} | hl_coins={len(hl_contexts)}"
-    )
-
-
-if __name__ == "__main__":
-    main()
+        f"Done | mode={run_mode} | candidates={len(candidates)} | alerts_sent={sent
