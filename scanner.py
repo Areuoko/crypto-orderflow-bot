@@ -279,6 +279,7 @@ def evaluate_dir(direction, closed, atr, poc, vah, val, vwap):
         if lvls:
             lv_p = 1
             reasons.append(f"حمایت روی سطح {'/'.join(lvls)}")
+        sl_px = curr["low"] - 0.20 * atr
     else:
         if (
             curr["high"] > p20_hi + 0.05 * atr
@@ -317,6 +318,7 @@ def evaluate_dir(direction, closed, atr, poc, vah, val, vwap):
         if lvls:
             lv_p = 1
             reasons.append(f"مقاومت روی سطح {'/'.join(lvls)}")
+        sl_px = curr["high"] + 0.20 * atr
 
     pre = sw_p + ab_p + cv_p + lv_p
     if not ((ab_p == 2 or cv_p == 2) and (sw_p == 2 or lv_p == 1) and pre >= 3):
@@ -325,8 +327,11 @@ def evaluate_dir(direction, closed, atr, poc, vah, val, vwap):
     return {
         "direction": direction,
         "score": pre,
+        "has_trio": (sw_p == 2 and ab_p == 2 and cv_p == 2),
         "reasons": reasons,
         "price": curr["close"],
+        "sl_px": sl_px,
+        "atr": atr,
         "vol_ratio": vratio,
         "delta_pct": dpct * 100.0,
         "poc": poc,
@@ -362,7 +367,7 @@ def apply_confirmations(cand, ob_info, hl_ctx, hl_mult):
             oi_usd = (float(hl_ctx.get("openInterest", 0.0)) / 2.0) * raw_mk
             px = cand["price"]
             prem = ((mk - px) / px) * 100.0 if px > 0 else 0.0
-            hl_note = f"OI {fmt_usd(oi_usd)} | Funding 8h: {f8:+.3f}%"
+            hl_note = f"OI {fmt_usd(oi_usd)} | F8h: {f8:+.3f}%"
 
             if d == "LONG" and (f8 <= -0.005 or prem <= -0.05):
                 score += 1
@@ -411,33 +416,74 @@ def format_alert(symbol: str, direction: str, items: list) -> str:
     rank = {"4h": 4, "1h": 3, "30m": 2, "15m": 1}
     items.sort(key=lambda x: (x["score"], rank.get(x["tf"], 0)), reverse=True)
     b = items[0]
-    tfs = ", ".join(x["tf"] for x in items)
-    ultra = b["score"] >= 7 or len(items) >= 2
+    tfs = " + ".join(x["tf"] for x in items)
+    is_mtf = len(items) >= 2
+    is_htf = any(x["tf"] in ("1h", "4h") for x in items)
+    has_trio = any(x["has_trio"] for x in items)
 
-    if direction == "LONG":
-        tag = "🔥 <b>سوپر سیگنال لانگ</b>" if ultra else "🟢 <b>سیگنال قوی لانگ</b>"
+    dir_fa = "📈 لانگ (خرید)" if direction == "LONG" else "📉 شورت (فروش)"
+    dir_dot = "🟢" if direction == "LONG" else "🔴"
+
+    # دسته‌بندی متمایز بر اساس درجه کیفیت و اعتبار
+    if has_trio or (b["score"] >= 7 and (is_htf or is_mtf)) or (is_mtf and b["score"] >= 6):
+        header = "💎💎💎 <b>الگوی الماس اردر فلو (درجه ۱)</b>"
+        advice = "👑 <i>اولویت بالا: هم‌نشینی قدرتمند لایه‌های کلیدی اردر فلو.</i>"
+        border = "━━━━━━━━━━━━━━━━━━━━"
+    elif b["score"] >= 6 or is_htf or is_mtf:
+        header = f"🔥 <b>سیگنال ممتاز {dir_dot}</b>"
+        advice = "💡 <i>کیفیت خوب: تاییدیه امتیاز بالا یا تایم‌فریم ۱ ساعته/۴ ساعته.</i>"
+        border = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
     else:
-        tag = "🔥 <b>سوپر سیگنال شورت</b>" if ultra else "🔴 <b>سیگنال قوی شورت</b>"
+        header = "⚠️ <b>هشدار واچ‌لیست (لب مرز ۵/۹)</b>"
+        advice = "⚡ <i>احتیاط: تایم‌فریم پایین با حداقل امتیاز؛ روند 1h/4h را چک کنید.</i>"
+        border = ""
 
-    mtf = " [چند تایم‌فریم]" if len(items) >= 2 else ""
-    lines = [
-        f"{tag} | <b>#{html.escape(symbol)}</b>",
-        f"⏱ تایم‌فریم: <b>{tfs}</b>{mtf} | امتیاز: <b>{b['score']} / 9</b>",
-        f"💰 قیمت اسپات: <code>{fmt_price(b['price'])}</code>",
+    # اهداف حجمی در مسیر معامله
+    px = b["price"]
+    atr = b["atr"]
+    if direction == "LONG":
+        c_lvls = [
+            (n, v) for n, v in [("POC", b["poc"]), ("VWAP", b["vwap"]), ("VAH", b["vah"])]
+            if v > px + 0.25 * atr
+        ]
+        c_lvls.sort(key=lambda t: t[1])
+    else:
+        c_lvls = [
+            (n, v) for n, v in [("POC", b["poc"]), ("VWAP", b["vwap"]), ("VAL", b["val"])]
+            if v < px - 0.25 * atr
+        ]
+        c_lvls.sort(key=lambda t: t[1], reverse=True)
+
+    tgt_str = " | ".join(f"{n} <code>{fmt_price(v)}</code>" for n, v in c_lvls[:2])
+    if not tgt_str:
+        tgt_str = "محدوده آزاد (پشت سقف/کف بعدی)"
+
+    lines = [header]
+    if border:
+        lines.append(border)
+
+    mtf_tag = " 🔗 <b>[چند تایم‌فریم]</b>" if is_mtf else ""
+    trio_tag = " ⭐ <b>[سه‌گانه طلایی]</b>" if has_trio else ""
+
+    lines.extend([
+        f"🪙 ارز: <b>#{html.escape(symbol)}</b> | جهت: <b>{dir_fa}</b>",
+        f"⏱ تایم: <b>{tfs}</b>{mtf_tag}{trio_tag}",
+        f"🏅 امتیاز کل: <b>{b['score']} / 9</b>",
+        f"💰 قیمت فعلی: <code>{fmt_price(px)}</code>",
+        f"🛑 ابطال ساختاری: <code>{fmt_price(b['sl_px'])}</code>",
+        f"🎯 سطوح پیش‌رو: {tgt_str}",
         "",
-        "<b>✅ تاییدیه‌های هم‌زمان:</b>",
-    ]
+        "<b>✅ آیتم‌های تیک‌خورده:</b>",
+    ])
     for r in b["reasons"]:
         lines.append(f"• {html.escape(r)}")
 
     lines.extend([
         "",
-        "<b>📊 خلاصه اردر فلو:</b>",
-        f"• حجم ({b['tf']}): <b>{b['vol_ratio']:.1f}x</b> | دلتا: <b>{b['delta_pct']:+.1f}%</b>",
-        f"• سطوح: POC <code>{fmt_price(b['poc'])}</code> | VWAP <code>{fmt_price(b['vwap'])}</code>",
-        f"• محدوده ارزش: <code>{fmt_price(b['val'])}</code> تا <code>{fmt_price(b['vah'])}</code>",
-        f"• اردربوک اسپات: {html.escape(b['ob_note'])}",
-        f"• فیوچرز (HL): {html.escape(b['hl_note'])}",
+        f"📊 حجم ({b['tf']}): <b>{b['vol_ratio']:.1f}x</b> | دلتا: <b>{b['delta_pct']:+.1f}%</b>",
+        f"📚 اردربوک: {html.escape(b['ob_note'])} | {html.escape(b['hl_note'])}",
+        "",
+        advice,
     ])
     return "\n".join(lines)
 
