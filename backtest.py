@@ -17,16 +17,11 @@ COINS = [
     "LTCUSDT", "NEARUSDT", "ARBUSDT", "APTUSDT", "PEPEUSDT",
 ]
 
-TF_BARS = {
-    "15m": 8800,
-    "30m": 4450,
-    "1h": 2280,
-    "4h": 650,
-}
-
+TF_BARS = {"1h": 2280, "2h": 1200}
 MAX_HOLD_BARS = 32
+
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "OrderFlow-Backtest-V2/1.0"})
+SESSION.headers.update({"User-Agent": "OrderFlow-M5-Audit/1.0"})
 
 
 def fetch_history(symbol: str, tf: str, target: int) -> list:
@@ -64,14 +59,9 @@ def fetch_history(symbol: str, tf: str, target: int) -> list:
             bqv = float(k[10])
             sqv = max(qv - bqv, 0.0)
             rows[ot] = {
-                "ot": ot,
-                "o": float(k[1]),
-                "h": float(k[2]),
-                "l": float(k[3]),
-                "c": float(k[4]),
-                "ct": int(k[6]),
-                "qv": qv,
-                "dl": bqv - sqv,
+                "ot": ot, "o": float(k[1]), "h": float(k[2]),
+                "l": float(k[3]), "c": float(k[4]), "ct": int(k[6]),
+                "qv": qv, "dl": bqv - sqv,
             }
 
         oldest = int(got[0][0])
@@ -126,21 +116,16 @@ def calc_vp_slice(candles: list, end_i: int, bins: int = 32):
         else:
             break
 
-    val = p_min + left * step
-    vah = p_min + (right + 1) * step
-    return poc, vah, val
+    return poc, p_min + (right + 1) * step, p_min + left * step
 
 
-def calc_vwap_at(candles: list, i: int, tf: str) -> float:
-    if tf == "4h":
-        start = max(0, i - 41)
-    else:
-        day0 = (candles[i]["ot"] // 86_400_000) * 86_400_000
-        start = i
-        while start > 0 and candles[start - 1]["ot"] >= day0:
-            start -= 1
-        if (i - start + 1) < 4:
-            start = max(0, i - 23)
+def calc_vwap_at(candles: list, i: int) -> float:
+    day0 = (candles[i]["ot"] // 86_400_000) * 86_400_000
+    start = i
+    while start > 0 and candles[start - 1]["ot"] >= day0:
+        start -= 1
+    if (i - start + 1) < 4:
+        start = max(0, i - 23)
 
     num = den = 0.0
     for c in candles[start:i + 1]:
@@ -157,13 +142,8 @@ def sim_trade(candles, i, d, entry, sl, rr):
 
     for j in range(i + 1, end_j + 1):
         bar = candles[j]
-        if d == "LONG":
-            hit_sl = bar["l"] <= sl
-            hit_tp = bar["h"] >= tp
-        else:
-            hit_sl = bar["h"] >= sl
-            hit_tp = bar["l"] <= tp
-
+        hit_sl = (bar["l"] <= sl) if d == "LONG" else (bar["h"] >= sl)
+        hit_tp = (bar["h"] >= tp) if d == "LONG" else (bar["l"] <= tp)
         if hit_sl:
             return "LOSS", -1.0, j
         if hit_tp:
@@ -174,34 +154,10 @@ def sim_trade(candles, i, d, entry, sl, rr):
     return "TIME", r_pnl, end_j
 
 
-def record_trade(buckets, model_name, busy, sym, tf, d, i, candles, entry, atr, sl_mult):
-    if i <= busy[(model_name, d)]:
-        return
-    sl = (candles[i]["l"] - sl_mult * atr) if d == "LONG" else (candles[i]["h"] + sl_mult * atr)
-    risk = (entry - sl) if d == "LONG" else (sl - entry)
-    if risk < 0.6 * atr:
-        risk = 0.6 * atr
-        sl = (entry - risk) if d == "LONG" else (entry + risk)
-    if risk > 3.5 * atr:
-        return
-
-    o15, r15, _ = sim_trade(candles, i, d, entry, sl, 1.5)
-    o20, r20, ex_j = sim_trade(candles, i, d, entry, sl, 2.0)
-    busy[(model_name, d)] = ex_j + 1
-
-    buckets[model_name].append({
-        "sym": sym, "tf": tf, "d": d,
-        "o15": o15, "r15": r15,
-        "o20": o20, "r20": r20,
-    })
-
-
-def test_series(sym: str, tf: str, candles: list) -> dict:
-    models = ["M1_TREND", "M2_STRICT5", "M3_TREND_15_1H", "M4_EXTREME", "M5_1H_PURE"]
-    buckets = {m: [] for m in models}
+def audit_series(sym: str, tf: str, candles: list, sl_mult: float) -> list:
     n = len(candles)
     if n < 120:
-        return buckets
+        return []
 
     trs = [candles[0]["h"] - candles[0]["l"]]
     for i in range(1, n):
@@ -218,11 +174,10 @@ def test_series(sym: str, tf: str, candles: list) -> dict:
         p_dl[i + 1] = p_dl[i] + candles[i]["dl"]
         p_ad[i + 1] = p_ad[i] + abs(candles[i]["dl"])
 
-    ema20 = calc_ema(candles, 20)
     ema50 = calc_ema(candles, 50)
     ema100 = calc_ema(candles, 100)
-
-    busy = {(m, d): -1 for m in models for d in ("LONG", "SHORT")}
+    busy = {"LONG": -1, "SHORT": -1}
+    trades = []
 
     for i in range(100, n - 5):
         cur = candles[i]
@@ -239,22 +194,18 @@ def test_series(sym: str, tf: str, candles: list) -> dict:
         dpct = cur["dl"] / cur["qv"]
         avg_ad = (p_ad[i] - p_ad[i - 49]) / 49.0
 
-        p20_lo = min(candles[k]["l"] for k in range(i - 20, i))
-        p20_hi = max(candles[k]["h"] for k in range(i - 20, i))
         p48_lo = min(candles[k]["l"] for k in range(i - 48, i))
         p48_hi = max(candles[k]["h"] for k in range(i - 48, i))
-
         vp_cache = None
 
         for d in ("LONG", "SHORT"):
-            sw20 = sw48 = ab_s = cv_s = lv_p = 0
+            if i <= busy[d]:
+                continue
 
+            sw48 = ab_s = cv_s = lv_p = 0
             if d == "LONG":
-                if cur["l"] < p20_lo - 0.05 * atr and cur["c"] > p20_lo and cpos >= 0.50:
-                    sw20 = 2
                 if cur["l"] < p48_lo - 0.10 * atr and cur["c"] > p48_lo and cpos >= 0.55:
                     sw48 = 2
-
                 if vratio >= 1.9 and lwick >= 0.42 and cpos >= 0.52 and dpct <= -0.06:
                     ab_s = 2
                 elif vratio >= 1.9 and lwick >= 0.35 and cpos >= 0.62 and dpct >= 0.08:
@@ -265,22 +216,16 @@ def test_series(sym: str, tf: str, candles: list) -> dict:
                 r_i = min(range(i - 2, i + 1), key=lambda k: candles[k]["l"])
                 p_i = min(range(i - 40, i - 5), key=lambda k: candles[k]["l"])
                 if (
-                    r_i >= i - 1
-                    and cpos >= 0.50
+                    r_i >= i - 1 and cpos >= 0.50
                     and candles[r_i]["l"] < candles[p_i]["l"]
                     and p_dl[i + 1] > p_dl[p_i + 1] + 0.80 * avg_ad
                     and p_dl[r_i + 1] > p_dl[p_i + 1]
                 ):
                     cv_s = 2
-
                 trend_ok = (cur["c"] > ema100[i] and ema50[i] > ema50[i - 6])
-                stretched = (cur["l"] < ema50[i] - 1.5 * atr)
             else:
-                if cur["h"] > p20_hi + 0.05 * atr and cur["c"] < p20_hi and cpos <= 0.50:
-                    sw20 = 2
                 if cur["h"] > p48_hi + 0.10 * atr and cur["c"] < p48_hi and cpos <= 0.45:
                     sw48 = 2
-
                 if vratio >= 1.9 and uwick >= 0.42 and cpos <= 0.48 and dpct >= 0.06:
                     ab_s = 2
                 elif vratio >= 1.9 and uwick >= 0.35 and cpos <= 0.38 and dpct <= -0.08:
@@ -291,23 +236,20 @@ def test_series(sym: str, tf: str, candles: list) -> dict:
                 r_i = max(range(i - 2, i + 1), key=lambda k: candles[k]["h"])
                 p_i = max(range(i - 40, i - 5), key=lambda k: candles[k]["h"])
                 if (
-                    r_i >= i - 1
-                    and cpos <= 0.50
+                    r_i >= i - 1 and cpos <= 0.50
                     and candles[r_i]["h"] > candles[p_i]["h"]
                     and p_dl[i + 1] < p_dl[p_i + 1] - 0.80 * avg_ad
                     and p_dl[r_i + 1] < p_dl[p_i + 1]
                 ):
                     cv_s = 2
-
                 trend_ok = (cur["c"] < ema100[i] and ema50[i] < ema50[i - 6])
-                stretched = (cur["h"] > ema50[i] + 1.5 * atr)
 
-            if not (ab_s >= 1 or cv_s == 2 or sw48 == 2):
+            if not (ab_s == 2 or cv_s == 2):
                 continue
 
             if vp_cache is None:
                 poc, vah, val = calc_vp_slice(candles, i, 32)
-                vwap = calc_vwap_at(candles, i, tf)
+                vwap = calc_vwap_at(candles, i)
                 vp_cache = (poc, vah, val, vwap)
             else:
                 poc, vah, val, vwap = vp_cache
@@ -319,36 +261,36 @@ def test_series(sym: str, tf: str, candles: list) -> dict:
                 if any(cur["h"] >= v - 0.30 * atr and cur["c"] <= v + 0.15 * atr for v in (vah, poc, vwap)):
                     lv_p = 1
 
-            strict_score = sw48 + ab_s + cv_s + lv_p
+            score = sw48 + ab_s + cv_s + lv_p
+            if not ((sw48 == 2 or lv_p == 1) and score >= 4):
+                continue
+
             entry = cur["c"]
+            sl = (cur["l"] - sl_mult * atr) if d == "LONG" else (cur["h"] + sl_mult * atr)
+            risk = (entry - sl) if d == "LONG" else (sl - entry)
+            if risk < 0.6 * atr:
+                risk = 0.6 * atr
+                sl = (entry - risk) if d == "LONG" else (entry + risk)
+            if risk > 3.5 * atr:
+                continue
 
-            # M1: هم‌جهت روند EMA50/100 + محرک قوی اردرفلو
-            if trend_ok and (ab_s == 2 or cv_s == 2) and (sw20 == 2 or lv_p == 1):
-                record_trade(buckets, "M1_TREND", busy, sym, tf, d, i, candles, entry, atr, 0.35)
+            o15, r15, _ = sim_trade(candles, i, d, entry, sl, 1.5)
+            o20, r20, ex_j = sim_trade(candles, i, d, entry, sl, 2.0)
+            busy[d] = ex_j + 1
 
-            # M2: الگوی سخت‌گیرانه (امتیاز سخت 5+ از 7)
-            if (ab_s == 2 or cv_s == 2) and (sw48 == 2 or lv_p == 1) and strict_score >= 5:
-                record_trade(buckets, "M2_STRICT5", busy, sym, tf, d, i, candles, entry, atr, 0.40)
+            trades.append({
+                "sym": sym, "tf": tf, "d": d, "score": score,
+                "trend": trend_ok,
+                "o15": o15, "r15": r15, "o20": o20, "r20": r20,
+            })
 
-            # M3: هم‌جهت روند + فیلتر سخت فقط روی 15m و 1h
-            if tf in ("15m", "1h") and trend_ok and (ab_s == 2 or cv_s == 2) and (sw48 == 2 or lv_p == 1):
-                record_trade(buckets, "M3_TREND_15_1H", busy, sym, tf, d, i, candles, entry, atr, 0.40)
-
-            # M4: برگشت ضد روند فقط در کشیدگی شدید از EMA50 + Sweep48
-            if stretched and sw48 == 2 and (ab_s == 2 or cv_s == 2):
-                record_trade(buckets, "M4_EXTREME", busy, sym, tf, d, i, candles, entry, atr, 0.45)
-
-            # M5: تایم‌فریم 1h خالص با امتیاز سخت 4+ و استاپ 0.45 ATR
-            if tf == "1h" and (ab_s == 2 or cv_s == 2) and (sw48 == 2 or lv_p == 1) and strict_score >= 4:
-                record_trade(buckets, "M5_1H_PURE", busy, sym, tf, d, i, candles, entry, atr, 0.45)
-
-    return buckets
+    return trades
 
 
-def fmt_stat(items: list, title: str) -> str:
+def fmt_stat(items: list, label: str) -> str:
     n = len(items)
     if n == 0:
-        return f"• <b>{title}</b>: 0 سیگنال"
+        return f"• <b>{label}</b>: 0"
     w15 = sum(1 for x in items if x["o15"] == "WIN")
     l15 = sum(1 for x in items if x["o15"] == "LOSS")
     wr15 = (w15 / max(w15 + l15, 1)) * 100.0
@@ -358,12 +300,10 @@ def fmt_stat(items: list, title: str) -> str:
     l20 = sum(1 for x in items if x["o20"] == "LOSS")
     wr20 = (w20 / max(w20 + l20, 1)) * 100.0
     e20 = sum(x["r20"] for x in items) / n
-
-    per_day = n / 90.0
     return (
-        f"• <b>{title}</b> ({n} تا | ~{per_day:.1f}/روز):\n"
-        f"   1.5R : برد <b>{wr15:.1f}%</b> | میانگین <b>{e15:+.2f}R</b>\n"
-        f"   2.0R : برد <b>{wr20:.1f}%</b> | میانگین <b>{e20:+.2f}R</b>"
+        f"• <b>{label}</b> ({n}): "
+        f"1.5R [{wr15:.1f}% | {e15:+.2f}R] | "
+        f"2.0R [<b>{wr20:.1f}% | {e20:+.2f}R</b>]"
     )
 
 
@@ -395,35 +335,44 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
 
 def main():
     t0 = time.time()
-    tasks = [(sym, tf, bars) for sym in COINS for tf, bars in TF_BARS.items()]
-    all_b = {
-        "M1_TREND": [],
-        "M2_STRICT5": [],
-        "M3_TREND_15_1H": [],
-        "M4_EXTREME": [],
-        "M5_1H_PURE": [],
-    }
-
+    tasks = [(s, tf, b) for s in COINS for tf, b in TF_BARS.items()]
+    data = {}
     with ThreadPoolExecutor(max_workers=6) as ex:
         futs = {ex.submit(fetch_history, s, tf, b): (s, tf) for s, tf, b in tasks}
         for fut in futs:
-            s, tf = futs[fut]
-            res = test_series(s, tf, fut.result())
-            for k in all_b:
-                all_b[k].extend(res[k])
+            data[futs[fut]] = fut.result()
+
+    t_1h, t_2h, t_1h_060 = [], [], []
+    for s in COINS:
+        t_1h.extend(audit_series(s, "1h", data[(s, "1h")], 0.45))
+        t_2h.extend(audit_series(s, "2h", data[(s, "2h")], 0.45))
+        t_1h_060.extend(audit_series(s, "1h", data[(s, "1h")], 0.60))
+
+    coin_pnl = {
+        s: sum(x["r20"] for x in t_1h if x["sym"] == s)
+        for s in COINS
+    }
+    pos_coins = sum(1 for v in coin_pnl.values() if v > 0)
+    top3 = sorted(coin_pnl.items(), key=lambda x: x[1], reverse=True)[:3]
+    bot3 = sorted(coin_pnl.items(), key=lambda x: x[1])[:3]
 
     el = time.time() - t0
-    utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     lines = [
-        "🧪 <b>مسابقه ۵ مدل بهینه‌شده (۹۰ روز اخیر | ۱۵ ارز)</b>",
-        f"🕒 زمان: <code>{utc}</code> ({el:.1f}s)",
-        "<i>مدل برنده باید بعد از کسر کارمزد (~0.06R) هم کاملاً مثبت بماند:</i>",
+        f"🔬 <b>کالبدشکافی مدل برنده M5</b> ({el:.1f}s)",
         "",
-        fmt_stat(all_b["M1_TREND"], "M1: هم‌جهت روند + اردر فلو"),
-        fmt_stat(all_b["M2_STRICT5"], "M2: سخت‌گیرانه ۵+ (Sweep48 + جذب 1.9x)"),
-        fmt_stat(all_b["M3_TREND_15_1H"], "M3: هم‌جهت روند + Sweep48 (فقط 15m/1h)"),
-        fmt_stat(all_b["M4_EXTREME"], "M4: برگشت ضد روند (فقط کشیدگی شدید)"),
-        fmt_stat(all_b["M5_1H_PURE"], "M5: خالص 1h سخت‌گیرانه"),
+        fmt_stat(t_1h, "1h کل (SL 0.45 ATR)"),
+        fmt_stat([x for x in t_1h if x["d"] == "LONG"], "1h فقط LONG"),
+        fmt_stat([x for x in t_1h if x["d"] == "SHORT"], "1h فقط SHORT"),
+        fmt_stat([x for x in t_1h if x["trend"]], "1h هم‌جهت روند"),
+        fmt_stat([x for x in t_1h if not x["trend"]], "1h خلاف روند"),
+        fmt_stat([x for x in t_1h if x["score"] == 4], "1h فقط امتیاز 4"),
+        fmt_stat([x for x in t_1h if x["score"] >= 5], "1h امتیاز 5+"),
+        fmt_stat(t_1h_060, "1h با SL 0.60 ATR"),
+        fmt_stat(t_2h, "تایم 2h (SL 0.45 ATR)"),
+        "",
+        f"🪙 ارزهای سودده در 1h (2.0R): <b>{pos_coins} از {len(COINS)}</b>",
+        "🏆 بهترین: " + ", ".join(f"{s}({v:+.1f}R)" for s, v in top3),
+        "📉 ضعیف‌ترین: " + ", ".join(f"{s}({v:+.1f}R)" for s, v in bot3),
     ]
 
     msg = "\n".join(lines)
