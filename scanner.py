@@ -8,16 +8,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import urllib3.util.connection as urllib3_cn
 
-# اجبار به استفاده از IPv4 برای جلوگیری از تایم‌اوت تلگرام روی سرورهای گیت‌هاب
 urllib3_cn.allowed_gai_family = lambda: socket.AF_INET
 
-# ==========================================
-# تنظیمات اصلی (در صورت نیاز قابل تغییر)
-# ==========================================
-BINANCE_SPOT_BASE = "https://data-api.binance.vision"
-HYPERLIQUID_INFO = "https://api.hyperliquid.xyz/info"
+BINANCE_BASE = "https://data-api.binance.vision"
+HL_URL = "https://api.hyperliquid.xyz/info"
 
-# (نماد بایننس اسپات, نماد هایپرلیکوئید, ضریب قیمت هایپرلیکوئید نسبت به اسپات)
 COINS = [
     ("BTCUSDT", "BTC", 1),
     ("ETHUSDT", "ETH", 1),
@@ -37,8 +32,8 @@ COINS = [
 ]
 
 TIMEFRAMES = ["15m", "30m", "1h", "4h"]
-FRESH_WINDOW_MS = 14 * 60 * 1000  # فقط کندل‌هایی که در 14 دقیقه اخیر بسته شده‌اند
-MIN_FINAL_SCORE = 5               # حداقل امتیاز برای سیگنال قوی (از 9)
+FRESH_WINDOW_MS = 14 * 60 * 1000
+MIN_FINAL_SCORE = 5
 MAX_WORKERS = 8
 
 SESSION = requests.Session()
@@ -65,35 +60,32 @@ def fmt_usd(val: float) -> str:
     return f"${val:.0f}"
 
 
-def fetch_hyperliquid_contexts() -> dict:
-    """دریافت OI، Funding Rate و Mark Price کل ارزهای Hyperliquid با یک درخواست."""
+def fetch_hl_contexts() -> dict:
     for attempt in range(3):
         try:
             r = SESSION.post(
-                HYPERLIQUID_INFO,
+                HL_URL,
                 json={"type": "metaAndAssetCtxs"},
                 timeout=12,
             )
             if r.status_code == 200:
                 data = r.json()
-                universe = data[0].get("universe", [])
+                uni = data[0].get("universe", [])
                 ctxs = data[1]
-                result = {}
-                for meta, ctx in zip(universe, ctxs):
-                    name = meta.get("name")
-                    if name:
-                        result[name] = ctx
-                return result
+                return {
+                    m["name"]: c
+                    for m, c in zip(uni, ctxs)
+                    if m.get("name")
+                }
         except Exception:
             pass
         time.sleep(1.0 * (attempt + 1))
     return {}
 
 
-def fetch_binance_klines(symbol: str, tf: str, limit: int = 100) -> list:
-    """دریافت کندل‌های اسپات بایننس همراه با حجم خریدار مهاجم (Taker Buy Volume)."""
-    url = f"{BINANCE_SPOT_BASE}/api/v3/klines"
-    for attempt in range(2):
+def fetch_klines(symbol: str, tf: str, limit: int = 100) -> list:
+    url = f"{BINANCE_BASE}/api/v3/klines"
+    for _ in range(2):
         try:
             r = SESSION.get(
                 url,
@@ -101,36 +93,36 @@ def fetch_binance_klines(symbol: str, tf: str, limit: int = 100) -> list:
                 timeout=10,
             )
             if r.status_code == 200:
-                raw = r.json()
-                candles = []
-                for k in raw:
-                    qvol = float(k[7])
-                    buy_qvol = float(k[10])
-                    sell_qvol = max(qvol - buy_qvol, 0.0)
-                    candles.append({
+                out = []
+                for k in r.json():
+                    qv = float(k[7])
+                    bqv = float(k[10])
+                    sqv = max(qv - bqv, 0.0)
+                    out.append({
                         "open_time": int(k[0]),
                         "open": float(k[1]),
                         "high": float(k[2]),
                         "low": float(k[3]),
                         "close": float(k[4]),
-                        "vol": float(k[5]),
                         "close_time": int(k[6]),
-                        "qvol": qvol,
-                        "buy_qvol": buy_qvol,
-                        "delta_usdt": buy_qvol - sell_qvol,
+                        "qvol": qv,
+                        "delta_usdt": bqv - sqv,
                     })
-                return candles
+                return out
         except Exception:
             pass
         time.sleep(0.5)
     return []
 
 
-def fetch_spot_orderbook_imbalance(symbol: str) -> tuple[float, float, float] | None:
-    """محاسبه برتری خریدار یا فروشنده در عمق 0.5% اردربوک اسپات."""
-    url = f"{BINANCE_SPOT_BASE}/api/v3/depth"
+def fetch_spot_ob(symbol: str):
+    url = f"{BINANCE_BASE}/api/v3/depth"
     try:
-        r = SESSION.get(url, params={"symbol": symbol, "limit": 500}, timeout=10)
+        r = SESSION.get(
+            url,
+            params={"symbol": symbol, "limit": 500},
+            timeout=10,
+        )
         if r.status_code != 200:
             return None
         book = r.json()
@@ -139,13 +131,14 @@ def fetch_spot_orderbook_imbalance(symbol: str) -> tuple[float, float, float] | 
         if not bids or not asks:
             return None
 
-        best_bid = float(bids[0][0])
-        best_ask = float(asks[0][0])
-        bid_floor = best_bid * 0.995   # تا 0.5% پایین‌تر
-        ask_ceil = best_ask * 1.005    # تا 0.5% بالاتر
-
-        bid_usd = sum(float(p) * float(q) for p, q in bids if float(p) >= bid_floor)
-        ask_usd = sum(float(p) * float(q) for p, q in asks if float(p) <= ask_ceil)
+        bid_floor = float(bids[0][0]) * 0.995
+        ask_ceil = float(asks[0][0]) * 1.005
+        bid_usd = sum(
+            float(p) * float(q) for p, q in bids if float(p) >= bid_floor
+        )
+        ask_usd = sum(
+            float(p) * float(q) for p, q in asks if float(p) <= ask_ceil
+        )
         if bid_usd <= 0 or ask_usd <= 0:
             return None
         return bid_usd, ask_usd, (bid_usd / ask_usd)
@@ -167,44 +160,37 @@ def calc_atr(candles: list, period: int = 14) -> float:
     return max(atr, candles[-1]["close"] * 0.0005)
 
 
-def calc_volume_profile(candles: list, bins: int = 32) -> tuple[float, float, float]:
-    """محاسبه POC، VAH و VAL روی 48 کندل اخیر."""
+def calc_vp(candles: list, bins: int = 32):
     sub = candles[-48:]
     p_min = min(c["low"] for c in sub)
     p_max = max(c["high"] for c in sub)
     if p_max <= p_min:
-        mid = p_min
-        return mid, mid, mid
+        return p_min, p_min, p_min
 
     step = (p_max - p_min) / bins
-    bin_vols = [0.0] * bins
-
+    bvols = [0.0] * bins
     for c in sub:
         lo_i = max(0, min(bins - 1, int((c["low"] - p_min) / step)))
         hi_i = max(0, min(bins - 1, int((c["high"] - p_min) / step)))
-        span = hi_i - lo_i + 1
-        share = c["qvol"] / span
+        share = c["qvol"] / (hi_i - lo_i + 1)
         for idx in range(lo_i, hi_i + 1):
-            bin_vols[idx] += share
+            bvols[idx] += share
 
-    total_vol = sum(bin_vols)
-    poc_idx = max(range(bins), key=lambda i: bin_vols[i])
-    poc = p_min + (poc_idx + 0.5) * step
+    total = sum(bvols)
+    poc_i = max(range(bins), key=lambda i: bvols[i])
+    poc = p_min + (poc_i + 0.5) * step
+    acc = bvols[poc_i]
+    left, right = poc_i, poc_i
 
-    target = total_vol * 0.70
-    acc = bin_vols[poc_idx]
-    left = poc_idx
-    right = poc_idx
-
-    while acc < target and (left > 0 or right < bins - 1):
-        v_left = bin_vols[left - 1] if left > 0 else -1.0
-        v_right = bin_vols[right + 1] if right < bins - 1 else -1.0
-        if v_left >= v_right and left > 0:
+    while acc < total * 0.70 and (left > 0 or right < bins - 1):
+        vl = bvols[left - 1] if left > 0 else -1.0
+        vr = bvols[right + 1] if right < bins - 1 else -1.0
+        if vl >= vr and left > 0:
             left -= 1
-            acc += bin_vols[left]
+            acc += bvols[left]
         elif right < bins - 1:
             right += 1
-            acc += bin_vols[right]
+            acc += bvols[right]
         else:
             break
 
@@ -217,164 +203,132 @@ def calc_vwap(candles: list, tf: str, now_ms: int) -> float:
     if tf == "4h":
         sub = candles[-42:]
     else:
-        today_start = (now_ms // 86_400_000) * 86_400_000
-        sub = [c for c in candles if c["open_time"] >= today_start]
+        day0 = (now_ms // 86_400_000) * 86_400_000
+        sub = [c for c in candles if c["open_time"] >= day0]
         if len(sub) < 4:
             sub = candles[-24:]
-
-    num = 0.0
-    den = 0.0
-    for c in sub:
-        tp = (c["high"] + c["low"] + c["close"]) / 3.0
-        num += tp * c["qvol"]
-        den += c["qvol"]
+    num = sum(
+        ((c["high"] + c["low"] + c["close"]) / 3.0) * c["qvol"]
+        for c in sub
+    )
+    den = sum(c["qvol"] for c in sub)
     return (num / den) if den > 0 else candles[-1]["close"]
 
 
-def evaluate_direction(
-    direction: str,
-    closed: list,
-    atr: float,
-    poc: float,
-    vah: float,
-    val: float,
-    vwap: float,
-) -> dict | None:
-    """ارزیابی اولیه لایه‌های کندلی، مکان، جذب و واگرایی CVD (پیش از چک کردن اردربوک)."""
+def evaluate_dir(direction, closed, atr, poc, vah, val, vwap):
     curr = closed[-1]
     crange = curr["high"] - curr["low"]
     if crange < 0.45 * atr or curr["qvol"] <= 0:
         return None
 
-    close_pos = (curr["close"] - curr["low"]) / crange
-    upper_wick = curr["high"] - max(curr["open"], curr["close"])
-    lower_wick = min(curr["open"], curr["close"]) - curr["low"]
-    upper_wick_ratio = upper_wick / crange
-    lower_wick_ratio = lower_wick / crange
-
+    cpos = (curr["close"] - curr["low"]) / crange
+    uwick = (curr["high"] - max(curr["open"], curr["close"])) / crange
+    lwick = (min(curr["open"], curr["close"]) - curr["low"]) / crange
     avg_qvol = sum(c["qvol"] for c in closed[-21:-1]) / 20.0
-    vol_ratio = curr["qvol"] / max(avg_qvol, 1.0)
-    delta_pct = curr["delta_usdt"] / curr["qvol"]
+    vratio = curr["qvol"] / max(avg_qvol, 1.0)
+    dpct = curr["delta_usdt"] / curr["qvol"]
 
-    prior_20_low = min(c["low"] for c in closed[-21:-1])
-    prior_20_high = max(c["high"] for c in closed[-21:-1])
+    p20_lo = min(c["low"] for c in closed[-21:-1])
+    p20_hi = max(c["high"] for c in closed[-21:-1])
 
-    # ساخت سری CVD روی 50 کندل اخیر
     sub = closed[-50:]
-    cvd = []
-    running = 0.0
+    cvd, run = [], 0.0
     for c in sub:
-        running += c["delta_usdt"]
-        cvd.append(running)
-    avg_abs_delta = sum(abs(c["delta_usdt"]) for c in sub[:-1]) / max(len(sub) - 1, 1)
+        run += c["delta_usdt"]
+        cvd.append(run)
+    avg_ad = sum(abs(c["delta_usdt"]) for c in sub[:-1]) / 49.0
 
     reasons = []
-    sweep_pts = 0
-    abs_pts = 0
-    cvd_pts = 0
-    level_pts = 0
+    sw_p = ab_p = cv_p = lv_p = 0
 
     if direction == "LONG":
-        # 1) Liquidity Sweep
         if (
-            curr["low"] < prior_20_low - 0.05 * atr
-            and curr["close"] > prior_20_low
-            and close_pos >= 0.45
+            curr["low"] < p20_lo - 0.05 * atr
+            and curr["close"] > p20_lo
+            and cpos >= 0.45
         ):
-            sweep_pts = 2
+            sw_p = 2
             reasons.append("شکار لیکوئیدیتی کف (Liquidity Sweep)")
 
-        # 2) Absorption / Reversal Volume
-        if vol_ratio >= 1.7 and lower_wick_ratio >= 0.42 and close_pos >= 0.50 and delta_pct <= -0.06:
-            abs_pts = 2
-            reasons.append(f"جذب لیمیت خرید + شدوی برگشتی (حجم {vol_ratio:.1f}x)")
-        elif vol_ratio >= 1.7 and lower_wick_ratio >= 0.32 and close_pos >= 0.62 and delta_pct >= 0.08:
-            abs_pts = 2
-            reasons.append(f"حمله خریدار + اسپایک حجم (حجم {vol_ratio:.1f}x)")
-        elif vol_ratio >= 1.35 and lower_wick_ratio >= 0.45 and close_pos >= 0.55:
-            abs_pts = 1
-            reasons.append(f"ریجکت صعودی با حجم بالا ({vol_ratio:.1f}x)")
+        if vratio >= 1.7 and lwick >= 0.42 and cpos >= 0.50 and dpct <= -0.06:
+            ab_p = 2
+            reasons.append(f"جذب لیمیت خرید + شدوی برگشتی ({vratio:.1f}x)")
+        elif vratio >= 1.7 and lwick >= 0.32 and cpos >= 0.62 and dpct >= 0.08:
+            ab_p = 2
+            reasons.append(f"حمله خریدار + اسپایک حجم ({vratio:.1f}x)")
+        elif vratio >= 1.35 and lwick >= 0.45 and cpos >= 0.55:
+            ab_p = 1
+            reasons.append(f"ریجکت صعودی با حجم بالا ({vratio:.1f}x)")
 
-        # 3) Spot CVD Divergence
-        recent_low_i = min(range(47, 50), key=lambda i: sub[i]["low"])
-        prior_low_i = min(range(15, 45), key=lambda i: sub[i]["low"])
+        r_i = min(range(47, 50), key=lambda i: sub[i]["low"])
+        p_i = min(range(15, 45), key=lambda i: sub[i]["low"])
         if (
-            recent_low_i >= 48
-            and close_pos >= 0.45
-            and sub[recent_low_i]["low"] <= sub[prior_low_i]["low"] + 0.15 * atr
-            and cvd[-1] > cvd[prior_low_i] + 0.40 * avg_abs_delta
-            and cvd[recent_low_i] > cvd[prior_low_i]
+            r_i >= 48
+            and cpos >= 0.45
+            and sub[r_i]["low"] <= sub[p_i]["low"] + 0.15 * atr
+            and cvd[-1] > cvd[p_i] + 0.40 * avg_ad
+            and cvd[r_i] > cvd[p_i]
         ):
-            cvd_pts = 2
+            cv_p = 2
             reasons.append("واگرایی صعودی Spot CVD")
 
-        # 4) Key Volume Level
-        matched_levels = []
-        for name, lvl in [("VAL", val), ("POC", poc), ("VWAP", vwap)]:
-            if curr["low"] <= lvl + 0.30 * atr and curr["close"] >= lvl - 0.15 * atr:
-                matched_levels.append(name)
-        if matched_levels:
-            level_pts = 1
-            reasons.append(f"حمایت روی سطح {'/'.join(matched_levels)}")
-
-    else:  # SHORT
-        # 1) Liquidity Sweep
+        lvls = [
+            n for n, v in [("VAL", val), ("POC", poc), ("VWAP", vwap)]
+            if curr["low"] <= v + 0.30 * atr and curr["close"] >= v - 0.15 * atr
+        ]
+        if lvls:
+            lv_p = 1
+            reasons.append(f"حمایت روی سطح {'/'.join(lvls)}")
+    else:
         if (
-            curr["high"] > prior_20_high + 0.05 * atr
-            and curr["close"] < prior_20_high
-            and close_pos <= 0.55
+            curr["high"] > p20_hi + 0.05 * atr
+            and curr["close"] < p20_hi
+            and cpos <= 0.55
         ):
-            sweep_pts = 2
+            sw_p = 2
             reasons.append("شکار لیکوئیدیتی سقف (Liquidity Sweep)")
 
-        # 2) Absorption / Reversal Volume
-        if vol_ratio >= 1.7 and upper_wick_ratio >= 0.42 and close_pos <= 0.50 and delta_pct >= 0.06:
-            abs_pts = 2
-            reasons.append(f"جذب لیمیت فروش + شدوی برگشتی (حجم {vol_ratio:.1f}x)")
-        elif vol_ratio >= 1.7 and upper_wick_ratio >= 0.32 and close_pos <= 0.38 and delta_pct <= -0.08:
-            abs_pts = 2
-            reasons.append(f"حمله فروشنده + اسپایک حجم (حجم {vol_ratio:.1f}x)")
-        elif vol_ratio >= 1.35 and upper_wick_ratio >= 0.45 and close_pos <= 0.45:
-            abs_pts = 1
-            reasons.append(f"ریجکت نزولی با حجم بالا ({vol_ratio:.1f}x)")
+        if vratio >= 1.7 and uwick >= 0.42 and cpos <= 0.50 and dpct >= 0.06:
+            ab_p = 2
+            reasons.append(f"جذب لیمیت فروش + شدوی برگشتی ({vratio:.1f}x)")
+        elif vratio >= 1.7 and uwick >= 0.32 and cpos <= 0.38 and dpct <= -0.08:
+            ab_p = 2
+            reasons.append(f"حمله فروشنده + اسپایک حجم ({vratio:.1f}x)")
+        elif vratio >= 1.35 and uwick >= 0.45 and cpos <= 0.45:
+            ab_p = 1
+            reasons.append(f"ریجکت نزولی با حجم بالا ({vratio:.1f}x)")
 
-        # 3) Spot CVD Divergence
-        recent_high_i = max(range(47, 50), key=lambda i: sub[i]["high"])
-        prior_high_i = max(range(15, 45), key=lambda i: sub[i]["high"])
+        r_i = max(range(47, 50), key=lambda i: sub[i]["high"])
+        p_i = max(range(15, 45), key=lambda i: sub[i]["high"])
         if (
-            recent_high_i >= 48
-            and close_pos <= 0.55
-            and sub[recent_high_i]["high"] >= sub[prior_high_i]["high"] - 0.15 * atr
-            and cvd[-1] < cvd[prior_high_i] - 0.40 * avg_abs_delta
-            and cvd[recent_high_i] < cvd[prior_high_i]
+            r_i >= 48
+            and cpos <= 0.55
+            and sub[r_i]["high"] >= sub[p_i]["high"] - 0.15 * atr
+            and cvd[-1] < cvd[p_i] - 0.40 * avg_ad
+            and cvd[r_i] < cvd[p_i]
         ):
-            cvd_pts = 2
+            cv_p = 2
             reasons.append("واگرایی نزولی Spot CVD")
 
-        # 4) Key Volume Level
-        matched_levels = []
-        for name, lvl in [("VAH", vah), ("POC", poc), ("VWAP", vwap)]:
-            if curr["high"] >= lvl - 0.30 * atr and curr["close"] <= lvl + 0.15 * atr:
-                matched_levels.append(name)
-        if matched_levels:
-            level_pts = 1
-            reasons.append(f"مقاومت روی سطح {'/'.join(matched_levels)}")
+        lvls = [
+            n for n, v in [("VAH", vah), ("POC", poc), ("VWAP", vwap)]
+            if curr["high"] >= v - 0.30 * atr and curr["close"] <= v + 0.15 * atr
+        ]
+        if lvls:
+            lv_p = 1
+            reasons.append(f"مقاومت روی سطح {'/'.join(lvls)}")
 
-    has_core_of = (abs_pts == 2) or (cvd_pts == 2)
-    has_core_loc = (sweep_pts == 2) or (level_pts == 1)
-    pre_score = sweep_pts + abs_pts + cvd_pts + level_pts
-
-    if not (has_core_of and has_core_loc and pre_score >= 3):
+    pre = sw_p + ab_p + cv_p + lv_p
+    if not ((ab_p == 2 or cv_p == 2) and (sw_p == 2 or lv_p == 1) and pre >= 3):
         return None
 
     return {
         "direction": direction,
-        "pre_score": pre_score,
-        "score": pre_score,
+        "score": pre,
         "reasons": reasons,
         "price": curr["close"],
-        "vol_ratio": vol_ratio,
-        "delta_pct": delta_pct * 100.0,
+        "vol_ratio": vratio,
+        "delta_pct": dpct * 100.0,
         "poc": poc,
         "vah": vah,
         "val": val,
@@ -382,47 +336,40 @@ def evaluate_direction(
     }
 
 
-def apply_realtime_confirmations(
-    cand: dict,
-    ob_info: tuple[float, float, float] | None,
-    hl_ctx: dict | None,
-    hl_mult: int,
-) -> dict:
-    """افزودن امتیاز اردربوک اسپات و داده‌های فیوچرز Hyperliquid."""
-    direction = cand["direction"]
+def apply_confirmations(cand, ob_info, hl_ctx, hl_mult):
+    d = cand["direction"]
     reasons = list(cand["reasons"])
     score = cand["score"]
 
     ob_note = "نامشخص"
     if ob_info:
-        bid_usd, ask_usd, ratio = ob_info
-        inv_ratio = 1.0 / ratio if ratio > 0 else 0.0
+        _, _, ratio = ob_info
+        inv = (1.0 / ratio) if ratio > 0 else 0.0
         ob_note = f"Bid/Ask: {ratio:.2f}x"
-        if direction == "LONG" and ratio >= 1.45:
+        if d == "LONG" and ratio >= 1.45:
             score += 1
             reasons.append(f"برتری دیوار خرید اسپات ({ratio:.2f}x)")
-        elif direction == "SHORT" and inv_ratio >= 1.45:
+        elif d == "SHORT" and inv >= 1.45:
             score += 1
-            reasons.append(f"برتری دیوار فروش اسپات ({inv_ratio:.2f}x)")
+            reasons.append(f"برتری دیوار فروش اسپات ({inv:.2f}x)")
 
     hl_note = "در دسترس نیست"
     if hl_ctx:
         try:
-            funding_hr = float(hl_ctx.get("funding", 0.0))
-            funding_8h_pct = funding_hr * 8.0 * 100.0
-            mark_px = float(hl_ctx.get("markPx", 0.0)) / hl_mult
-            oi_coins = float(hl_ctx.get("openInterest", 0.0))
-            # Open interest در Hyperliquid مجموع لانگ+شورت است؛ تقسیم بر 2 برای یک سمت
-            oi_usd = (oi_coins / 2.0) * float(hl_ctx.get("markPx", 0.0))
-            prem_pct = ((mark_px - cand["price"]) / cand["price"]) * 100.0 if cand["price"] > 0 else 0.0
-            hl_note = f"OI {fmt_usd(oi_usd)} | Funding 8h: {funding_8h_pct:+.3f}%"
+            f8 = float(hl_ctx.get("funding", 0.0)) * 8.0 * 100.0
+            raw_mk = float(hl_ctx.get("markPx", 0.0))
+            mk = raw_mk / hl_mult
+            oi_usd = (float(hl_ctx.get("openInterest", 0.0)) / 2.0) * raw_mk
+            px = cand["price"]
+            prem = ((mk - px) / px) * 100.0 if px > 0 else 0.0
+            hl_note = f"OI {fmt_usd(oi_usd)} | Funding 8h: {f8:+.3f}%"
 
-            if direction == "LONG" and (funding_8h_pct <= -0.005 or prem_pct <= -0.05):
+            if d == "LONG" and (f8 <= -0.005 or prem <= -0.05):
                 score += 1
-                reasons.append(f"فشار شورت/تخفیف فیوچرز (Funding {funding_8h_pct:+.3f}%)")
-            elif direction == "SHORT" and (funding_8h_pct >= 0.025 or prem_pct >= 0.05):
+                reasons.append(f"فشار شورت فیوچرز (Funding {f8:+.3f}%)")
+            elif d == "SHORT" and (f8 >= 0.025 or prem >= 0.05):
                 score += 1
-                reasons.append(f"اشباع لانگ در فیوچرز (Funding {funding_8h_pct:+.3f}%)")
+                reasons.append(f"اشباع لانگ فیوچرز (Funding {f8:+.3f}%)")
         except Exception:
             pass
 
@@ -456,154 +403,144 @@ def send_telegram(bot_token: str, chat_id: str, text: str) -> None:
             if 400 <= r.status_code < 500:
                 return
         except Exception as e:
-            print(f"Telegram attempt {attempt + 1}/3 failed: {e}", file=sys.stderr)
+            print(f"Telegram try {attempt + 1}/3: {e}", file=sys.stderr)
         time.sleep(2 * (attempt + 1))
 
 
-def format_alert_message(symbol: str, direction: str, items: list) -> str:
-    tf_rank = {"4h": 4, "1h": 3, "30m": 2, "15m": 1}
-    items.sort(key=lambda x: (x["score"], tf_rank.get(x["tf"], 0)), reverse=True)
-    best = items[0]
-    max_score = best["score"]
-    tfs_str = ", ".join(x["tf"] for x in items)
+def format_alert(symbol: str, direction: str, items: list) -> str:
+    rank = {"4h": 4, "1h": 3, "30m": 2, "15m": 1}
+    items.sort(key=lambda x: (x["score"], rank.get(x["tf"], 0)), reverse=True)
+    b = items[0]
+    tfs = ", ".join(x["tf"] for x in items)
+    ultra = b["score"] >= 7 or len(items) >= 2
 
-    is_ultra = max_score >= 7 or len(items) >= 2
     if direction == "LONG":
-        badge = "🔥 <b>سوپر سیگنال لانگ (LONG)</b>" if is_ultra else "🟢 <b>سیگنال قوی لانگ (LONG)</b>"
+        tag = "🔥 <b>سوپر سیگنال لانگ</b>" if ultra else "🟢 <b>سیگنال قوی لانگ</b>"
     else:
-        badge = "🔥 <b>سوپر سیگنال شورت (SHORT)</b>" if is_ultra else "🔴 <b>سیگنال قوی شورت (SHORT)</b>"
+        tag = "🔥 <b>سوپر سیگنال شورت</b>" if ultra else "🔴 <b>سیگنال قوی شورت</b>"
 
-    mtf_tag = " [هم‌گرایی چند تایم‌فریم!]" if len(items) >= 2 else ""
-
+    mtf = " [چند تایم‌فریم]" if len(items) >= 2 else ""
     lines = [
-        f"{badge} | <b>#{html.escape(symbol)}</b>",
-        f"⏱ تایم‌فریم: <b>{tfs_str}</b>{mtf_tag} | امتیاز: <b>{max_score} / 9</b>",
-        f"💰 قیمت اسپات: <code>{fmt_price(best['price'])}</code>",
+        f"{tag} | <b>#{html.escape(symbol)}</b>",
+        f"⏱ تایم‌فریم: <b>{tfs}</b>{mtf} | امتیاز: <b>{b['score']} / 9</b>",
+        f"💰 قیمت اسپات: <code>{fmt_price(b['price'])}</code>",
         "",
         "<b>✅ تاییدیه‌های هم‌زمان:</b>",
     ]
-    for r in best["reasons"]:
+    for r in b["reasons"]:
         lines.append(f"• {html.escape(r)}")
 
     lines.extend([
         "",
         "<b>📊 خلاصه اردر فلو:</b>",
-        f"• حجم کندل ({best['tf']}): <b>{best['vol_ratio']:.1f}x</b> | دلتا: <b>{best['delta_pct']:+.1f}%</b>",
-        f"• سطوح: POC <code>{fmt_price(best['poc'])}</code> | VWAP <code>{fmt_price(best['vwap'])}</code>",
-        f"• محدوده ارزش: VAL <code>{fmt_price(best['val'])}</code> — VAH <code>{fmt_price(best['vah'])}</code>",
-        f"• اردربوک اسپات: {html.escape(best['ob_note'])}",
-        f"• فیوچرز (HL): {html.escape(best['hl_note'])}",
+        f"• حجم ({b['tf']}): <b>{b['vol_ratio']:.1f}x</b> | دلتا: <b>{b['delta_pct']:+.1f}%</b>",
+        f"• سطوح: POC <code>{fmt_price(b['poc'])}</code> | VWAP <code>{fmt_price(b['vwap'])}</code>",
+        f"• محدوده ارزش: <code>{fmt_price(b['val'])}</code> تا <code>{fmt_price(b['vah'])}</code>",
+        f"• اردربوک اسپات: {html.escape(b['ob_note'])}",
+        f"• فیوچرز (HL): {html.escape(b['hl_note'])}",
     ])
     return "\n".join(lines)
 
 
 def main():
-    bot_token = os.environ.get("TG_BOT_TOKEN", "").strip()
+    token = os.environ.get("TG_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TG_CHAT_ID", "").strip()
-    run_mode = os.environ.get("RUN_MODE", "scan").strip().lower()
+    mode = os.environ.get("RUN_MODE", "scan").strip().lower()
 
-    if not bot_token or not chat_id:
-        print("ERROR: TG_BOT_TOKEN or TG_CHAT_ID is missing!", file=sys.stderr)
+    if not token or not chat_id:
+        print("ERROR: Missing TG_BOT_TOKEN or TG_CHAT_ID", file=sys.stderr)
         sys.exit(1)
 
     now_ms = int(time.time() * 1000)
-    hl_contexts = fetch_hyperliquid_contexts()
+    hl_ctxs = fetch_hl_contexts()
 
-    # دریافت هم‌زمان کندل‌های 15 ارز در 4 تایم‌فریم
-    tasks = []
-    klines_map = {}
+    tasks, kmap = [], {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for sym, hl_sym, mult in COINS:
             for tf in TIMEFRAMES:
-                fut = ex.submit(fetch_binance_klines, sym, tf, 100)
-                tasks.append((fut, sym, hl_sym, mult, tf))
+                fut = ex.submit(fetch_klines, sym, tf, 100)
+                tasks.append((fut, sym, tf))
+        for fut, sym, tf in tasks:
+            kmap[(sym, tf)] = fut.result()
 
-        for fut, sym, hl_sym, mult, tf in tasks:
-            klines_map[(sym, tf)] = fut.result()
-
-    # مرحله اول: ارزیابی کندل‌های تازه بسته‌شده
-    candidates = []
-    near_misses = []
-
+    cands, near = [], []
     for sym, hl_sym, mult in COINS:
         for tf in TIMEFRAMES:
-            raw = klines_map.get((sym, tf), [])
+            raw = kmap.get((sym, tf), [])
             closed = [c for c in raw if c["close_time"] < now_ms]
             if len(closed) < 55:
                 continue
 
-            age_ms = now_ms - closed[-1]["close_time"]
-            if run_mode != "test" and not (0 <= age_ms <= FRESH_WINDOW_MS):
+            age = now_ms - closed[-1]["close_time"]
+            if mode != "test" and not (0 <= age <= FRESH_WINDOW_MS):
                 continue
 
             atr = calc_atr(closed, 14)
-            poc, vah, val = calc_volume_profile(closed, 32)
+            poc, vah, val = calc_vp(closed, 32)
             vwap = calc_vwap(closed, tf, now_ms)
 
-            for direction in ("LONG", "SHORT"):
-                res = evaluate_direction(direction, closed, atr, poc, vah, val, vwap)
+            for d in ("LONG", "SHORT"):
+                res = evaluate_dir(d, closed, atr, poc, vah, val, vwap)
                 if res:
                     res["symbol"] = sym
                     res["hl_sym"] = hl_sym
                     res["hl_mult"] = mult
                     res["tf"] = tf
-                    candidates.append(res)
-                elif run_mode == "test":
-                    curr = closed[-1]
-                    avg_v = sum(c["qvol"] for c in closed[-21:-1]) / 20.0
-                    near_misses.append((curr["qvol"] / max(avg_v, 1.0), sym, tf, curr["close"]))
+                    cands.append(res)
+                elif mode == "test":
+                    cur = closed[-1]
+                    av = sum(c["qvol"] for c in closed[-21:-1]) / 20.0
+                    near.append((cur["qvol"] / max(av, 1.0), sym, tf, cur["close"]))
 
-    # مرحله دوم: دریافت اردربوک لحظه‌ای فقط برای کاندیداهای مستعد
-    unique_syms = sorted({c["symbol"] for c in candidates})
     ob_map = {}
-    if unique_syms:
+    syms = sorted({c["symbol"] for c in cands})
+    if syms:
         with ThreadPoolExecutor(max_workers=4) as ex:
-            ob_futs = {ex.submit(fetch_spot_orderbook_imbalance, sym): sym for sym in unique_syms}
-            for fut in as_completed(ob_futs):
-                sym = ob_futs[fut]
-                ob_map[sym] = fut.result()
+            futs = {ex.submit(fetch_spot_ob, s): s for s in syms}
+            for fut in as_completed(futs):
+                ob_map[futs[fut]] = fut.result()
 
-    # مرحله سوم: امتیازدهی نهایی و فیلتر سیگنال‌های قوی
-    grouped_alerts = {}
-    for cand in candidates:
-        sym = cand["symbol"]
-        final = apply_realtime_confirmations(
-            cand,
-            ob_map.get(sym),
-            hl_contexts.get(cand["hl_sym"]),
-            cand["hl_mult"],
+    grouped = {}
+    for c in cands:
+        sym = c["symbol"]
+        fin = apply_confirmations(
+            c, ob_map.get(sym), hl_ctxs.get(c["hl_sym"]), c["hl_mult"]
         )
-        if final["score"] >= MIN_FINAL_SCORE:
-            key = (sym, final["direction"])
-            grouped_alerts.setdefault(key, []).append(final)
+        if fin["score"] >= MIN_FINAL_SCORE:
+            grouped.setdefault((sym, fin["direction"]), []).append(fin)
 
-    # ارسال پیام‌ها به تلگرام
-    sent_count = 0
-    for (sym, direction), items in grouped_alerts.items():
-        msg = format_alert_message(sym, direction, items)
-        send_telegram(bot_token, chat_id, msg)
-        sent_count += 1
+    sent = 0
+    for (sym, d), items in grouped.items():
+        send_telegram(token, chat_id, format_alert(sym, d, items))
+        sent += 1
         time.sleep(0.35)
 
-    # در حالت تست، حتی اگر سیگنال قوی نباشد یک گزارش سلامت به تلگرام می‌فرستد
-    if run_mode == "test":
-        utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        btc_ok = len(klines_map.get(("BTCUSDT", "15m"), [])) > 0
-        hl_ok = "BTC" in hl_contexts
-        near_misses.sort(reverse=True)
-        top_vol = "\n".join(
-            f"• {sym} ({tf}): حجم {vr:.2f}x | قیمت <code>{fmt_price(px)}</code>"
-            for vr, sym, tf, px in near_misses[:3]
+    if mode == "test":
+        utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        b_ok = len(kmap.get(("BTCUSDT", "15m"), [])) > 0
+        h_ok = "BTC" in hl_ctxs
+        near.sort(reverse=True)
+        top = "\n".join(
+            f"• {s} ({t}): {v:.2f}x | <code>{fmt_price(p)}</code>"
+            for v, s, t, p in near[:3]
         )
-        status_msg = (
-            "✅ <b>تست اتصال اسکنر اردر فلو موفق بود!</b>\n"
-            f"🕒 زمان سرور: <code>{utc_str}</code>\n"
-            f"📡 دیتای اسپات بایننس: {'متصل ✅' if btc_ok else 'خطا ❌'}\n"
-            f"📡 دیتای فیوچرز هایپرلیکوئید: {'متصل ✅' if hl_ok else 'خطا ❌'}\n"
-            f"🎯 سیگنال‌های قوی یافت‌شده در این لحظه: <b>{sent_count}</b>\n\n"
-            f"<b>پرحجم‌ترین کندل‌های اخیر (صرفاً جهت تست):</b>\n{top_vol or 'موردی ثبت نشد'}"
+        msg = (
+            "✅ <b>تست اتصال اسکنر موفق بود!</b>\n"
+            f"🕒 زمان: <code>{utc}</code>\n"
+            f"📡 اسپات بایننس: {'متصل ✅' if b_ok else 'خطا ❌'}\n"
+            f"📡 فیوچرز هایپرلیکوئید: {'متصل ✅' if h_ok else 'خطا ❌'}\n"
+            f"🎯 سیگنال قوی فعلی: <b>{sent}</b>\n\n"
+            f"<b>پرحجم‌ترین کندل‌های اخیر:</b>\n{top or 'ندارد'}"
         )
-        send_telegram(bot_token, chat_id, status_msg)
+        send_telegram(token, chat_id, msg)
 
     print(
-        f"Done | mode={run_mode} | candidates={len(candidates)} | alerts_sent={sent
+        f"Done | mode={mode} | cands={len(cands)} | "
+        f"sent={sent} | hl={len(hl_ctxs)}"
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+# --- END OF FILE ---
