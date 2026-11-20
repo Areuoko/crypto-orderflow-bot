@@ -1,0 +1,32 @@
+name: Crypto OrderFlow Scanner
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "scan = فقط سیگنال قوی | test = ارسال پیام تست به تلگرام"
+        required: false
+        default: "scan"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install --quiet -r requirements.txt
+
+      - name: Run OrderFlow Scanner
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          RUN_MODE: ${{ github.event.inputs.mode || 'scan' }}
+        run: python scanner.py
